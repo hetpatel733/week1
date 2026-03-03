@@ -2,7 +2,7 @@
 set -e
 
 RPC_USER="alice"
-RPC_PASS="your_password_here"  # CHANGE THIS!
+RPC_PASS=""
 RPC_PORT="18443"
 
 # Make RPC calls
