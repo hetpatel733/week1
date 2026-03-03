@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -x
 
 RPC_USER="alice"
 RPC_PASS="password"
