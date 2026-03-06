@@ -1,5 +1,6 @@
 const Client = require('bitcoin-core');
 const fs = require('fs');
+const path = require('path');
 
 const baseConfig = {
     network: 'regtest',
@@ -238,7 +239,7 @@ async function main() {
     console.log(`Final Bob balance: ${await bob.getBalance()} BTC`);
 
     // Write transaction IDs to out.txt for test validation
-    fs.writeFileSync('out.txt', `${fundingTxId}\n${spendingTxId}\n`);
+    fs.writeFileSync(path.join(__dirname, '..', 'out.txt'), `${fundingTxId}\n${spendingTxId}\n`);
     console.log('Results written to out.txt');
 }
 
