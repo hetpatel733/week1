@@ -52,12 +52,35 @@ async function loadOrCreateWallet(name) {
     }
 }
 
+// Extract the private key expression from a wallet's descriptor for a given address
+async function getPrivKeyExpr(walletClient, addr) {
+    const addrInfo = await walletClient.command('getaddressinfo', addr);
+    const hdkeypath = addrInfo.hdkeypath; // e.g. "m/44'/1'/0'/0/5"
+    const pathParts = hdkeypath.split('/');
+    const keyIndex = pathParts[pathParts.length - 1]; // e.g. "5"
+
+    // Get all private descriptors from the wallet
+    const descList = await walletClient.command('listdescriptors', true);
+
+    // Find the external pkh descriptor (used for legacy addresses)
+    const pkhDesc = descList.descriptors.find(d =>
+        d.desc.startsWith('pkh(') && d.active && !d.internal
+    );
+    if (!pkhDesc) throw new Error('Could not find pkh descriptor');
+
+    // Extract the key expression from pkh(KEY_EXPR)#checksum
+    const descStr = pkhDesc.desc;
+    const keyExpr = descStr.slice(descStr.indexOf('(') + 1, descStr.lastIndexOf(')'));
+    // keyExpr is like: [fingerprint/44h/1h/0h]tprv8.../0/*
+
+    // Replace the wildcard * with the specific key index
+    return keyExpr.replace('*', keyIndex);
+}
+
 async function main() {
-    // Get blockchain info
     const blockchainInfo = await client.getBlockchainInfo();
     console.log('Blockchain Info:', blockchainInfo);
 
-    // Create/Load the wallets, named 'Miner', 'Alice' and 'Bob'
     await loadOrCreateWallet('Miner');
     await loadOrCreateWallet('Alice');
     await loadOrCreateWallet('Bob');
@@ -66,16 +89,12 @@ async function main() {
     const alice = getWalletClient('Alice');
     const bob = getWalletClient('Bob');
 
-    // Generate spendable balances in the Miner wallet (≥ 150 BTC)
+    // Mine blocks for spendable balance
     const minerAddress = await miner.getNewAddress();
     const currentBlocks = (await client.getBlockchainInfo()).blocks;
-
     if (currentBlocks < 103) {
-        const blocksToMine = 103 - currentBlocks;
-        console.log(`Mining ${blocksToMine} blocks to Miner address...`);
-        await client.command('generatetoaddress', blocksToMine, minerAddress);
+        await client.command('generatetoaddress', 103 - currentBlocks, minerAddress);
     }
-
     let minerBalance = await miner.getBalance();
     while (minerBalance < 150) {
         console.log(`Miner balance ${minerBalance} BTC, mining more blocks...`);
@@ -84,26 +103,26 @@ async function main() {
     }
     console.log(`Miner balance: ${minerBalance} BTC`);
 
-    // Send 15 BTC each to Alice and Bob
+    // Fund Alice and Bob with 15 BTC each
     const aliceFundAddress = await alice.getNewAddress();
     const bobFundAddress = await bob.getNewAddress();
     await miner.sendToAddress(aliceFundAddress, 15);
     await miner.sendToAddress(bobFundAddress, 15);
-
-    // Mine 6 blocks to confirm the funding transactions
     await client.command('generatetoaddress', 6, minerAddress);
     console.log(`Alice balance after funding: ${await alice.getBalance()} BTC`);
     console.log(`Bob balance after funding: ${await bob.getBalance()} BTC`);
 
-    // Construct 2-of-2 multisig (Alice & Bob) using P2WSH (native segwit)
+    // Get public keys from legacy addresses
     const aliceKeyAddr = await alice.getNewAddress('', 'legacy');
     const bobKeyAddr = await bob.getNewAddress('', 'legacy');
-    const aliceAddrInfo = await alice.getAddressInfo(aliceKeyAddr);
-    const bobAddrInfo = await bob.getAddressInfo(bobKeyAddr);
-    const alicePubKey = aliceAddrInfo.pubkey;
-    const bobPubKey = bobAddrInfo.pubkey;
+    const alicePubKey = (await alice.getAddressInfo(aliceKeyAddr)).pubkey;
+    const bobPubKey = (await bob.getAddressInfo(bobKeyAddr)).pubkey;
     console.log(`Alice pubkey: ${alicePubKey}`);
     console.log(`Bob pubkey: ${bobPubKey}`);
+
+    // Extract private key expressions for multisig descriptor import
+    const alicePrivKeyExpr = await getPrivKeyExpr(alice, aliceKeyAddr);
+    const bobPrivKeyExpr = await getPrivKeyExpr(bob, bobKeyAddr);
 
     // Create 2-of-2 P2WSH multisig address
     const multisigResult = await client.command('createmultisig', 2, [alicePubKey, bobPubKey], 'bech32');
@@ -112,26 +131,23 @@ async function main() {
     console.log(`Multisig P2WSH address: ${multisigAddress}`);
     console.log(`Witness script: ${witnessScript}`);
 
-    // Import multisig descriptor into both wallets for signing
-    const desc = `wsh(multi(2,${alicePubKey},${bobPubKey}))`;
-    const descInfo = await client.command('getdescriptorinfo', desc);
-    const fullDesc = descInfo.descriptor;
+    // Import multisig descriptors WITH private keys into each wallet
+    // Alice's wallet: Alice's private key + Bob's public key
+    const multiDescAlice = `wsh(multi(2,${alicePrivKeyExpr},${bobPubKey}))`;
+    const multiInfoAlice = await client.command('getdescriptorinfo', multiDescAlice);
+    const multiDescAliceWithCS = multiDescAlice + '#' + multiInfoAlice.checksum;
+    await alice.command('importdescriptors', [{ desc: multiDescAliceWithCS, timestamp: 'now' }]);
 
-    try {
-        await alice.command('addmultisigaddress', 2, [alicePubKey, bobPubKey], '', 'bech32');
-        await bob.command('addmultisigaddress', 2, [alicePubKey, bobPubKey], '', 'bech32');
-        console.log('Multisig registered in Alice and Bob wallets');
-    } catch (e) {
-        console.log(`addmultisigaddress failed (${e.message}), falling back to importdescriptors`);
-        await alice.command('importdescriptors', [{ desc: fullDesc, timestamp: 'now' }]);
-        await bob.command('importdescriptors', [{ desc: fullDesc, timestamp: 'now' }]);
-        console.log('Multisig descriptor imported into Alice and Bob wallets');
-    }
+    // Bob's wallet: Alice's public key + Bob's private key
+    const multiDescBob = `wsh(multi(2,${alicePubKey},${bobPrivKeyExpr}))`;
+    const multiInfoBob = await client.command('getdescriptorinfo', multiDescBob);
+    const multiDescBobWithCS = multiDescBob + '#' + multiInfoBob.checksum;
+    await bob.command('importdescriptors', [{ desc: multiDescBobWithCS, timestamp: 'now' }]);
+    console.log('Multisig descriptors with private keys imported into Alice and Bob wallets');
 
-    // Build funding PSBT: Alice and Bob each contribute one UTXO
+    // Build funding PSBT
     const aliceUTXOs = await alice.command('listunspent');
     const bobUTXOs = await bob.command('listunspent');
-
     const aliceUTXO = aliceUTXOs.find(u => u.amount >= 10);
     const bobUTXO = bobUTXOs.find(u => u.amount >= 10);
     if (!aliceUTXO || !bobUTXO) throw new Error('Insufficient UTXOs for Alice or Bob');
@@ -154,7 +170,6 @@ async function main() {
         { [bobChangeAddress]: changeEach }
     ];
 
-    // Create, sign, and broadcast funding transaction via PSBT
     let fundingPsbt = await client.command('createpsbt', fundingInputs, fundingOutputs);
     fundingPsbt = await client.command('utxoupdatepsbt', fundingPsbt);
 
@@ -168,14 +183,12 @@ async function main() {
     const fundingTxId = await client.sendRawTransaction(finalizedFunding.hex);
     console.log(`Funding TX ID: ${fundingTxId}`);
 
-    // Mine 6 blocks to confirm
     await client.command('generatetoaddress', 6, minerAddress);
     console.log('Mined 6 blocks to confirm funding transaction');
-
     console.log(`Alice balance: ${await alice.getBalance()} BTC`);
     console.log(`Bob balance: ${await bob.getBalance()} BTC`);
 
-    // Build spending transaction: spend the multisig output
+    // Build spending PSBT
     const fundingTxDetails = await client.command('getrawtransaction', fundingTxId, true);
     let multisigVout = -1;
     for (let i = 0; i < fundingTxDetails.vout.length; i++) {
@@ -199,42 +212,32 @@ async function main() {
         { [bobReceiveAddress]: eachReceives }
     ];
 
-    // Create raw spending transaction
-    const spendingRawTx = await client.command('createrawtransaction', spendingInputs, spendingOutputs);
+    // Create spending PSBT and update with multisig descriptor for witness script
+    let spendingPsbt = await client.command('createpsbt', spendingInputs, spendingOutputs);
+    spendingPsbt = await client.command('utxoupdatepsbt', spendingPsbt, [multiInfoAlice.descriptor]);
 
-    // Provide prevtxs with the witnessScript so wallets can sign the P2WSH multisig input
-    const multisigOutput = fundingTxDetails.vout[multisigVout];
-    const prevTxs = [{
-        txid: fundingTxId,
-        vout: multisigVout,
-        scriptPubKey: multisigOutput.scriptPubKey.hex,
-        redeemScript: witnessScript,
-        witnessScript: witnessScript,
-        amount: multisigAmount
-    }];
+    // Both wallets sign (they now have private keys for the multisig)
+    const aliceSpendSigned = await alice.command('walletprocesspsbt', spendingPsbt, true, 'ALL');
+    const bobSpendSigned = await bob.command('walletprocesspsbt', spendingPsbt, true, 'ALL');
 
-    // Sign sequentially: Alice signs first, then Bob signs Alice's partially-signed tx
-    const aliceSigned = await alice.command('signrawtransactionwithwallet', spendingRawTx, prevTxs);
-    console.log(`Alice signed spending tx (complete: ${aliceSigned.complete})`);
+    const combinedSpending = await client.command('combinepsbt', [aliceSpendSigned.psbt, bobSpendSigned.psbt]);
+    const finalizedSpending = await client.command('finalizepsbt', combinedSpending);
+    if (!finalizedSpending.complete) throw new Error('Spending PSBT could not be finalized');
 
-    const bobSigned = await bob.command('signrawtransactionwithwallet', aliceSigned.hex, prevTxs);
-    console.log(`Bob signed spending tx (complete: ${bobSigned.complete})`);
-
-    if (!bobSigned.complete) throw new Error('Spending transaction could not be fully signed');
-
-    // Broadcast the fully signed spending transaction
-    const spendingTxId = await client.sendRawTransaction(bobSigned.hex);
+    const spendingTxId = await client.sendRawTransaction(finalizedSpending.hex);
     console.log(`Spending TX ID: ${spendingTxId}`);
 
-    // Mine 6 blocks to confirm the spending transaction
     await client.command('generatetoaddress', 6, minerAddress);
     console.log('Mined 6 blocks to confirm spending transaction');
-
-    // Print final balances
     console.log(`Final Alice balance: ${await alice.getBalance()} BTC`);
     console.log(`Final Bob balance: ${await bob.getBalance()} BTC`);
 
-    // Write transaction IDs to out.txt for test validation
+    // Debug: print witness data for verification
+    const spendingTxDetails = await client.command('getrawtransaction', spendingTxId, true);
+    const witness = spendingTxDetails.vin[0].txinwitness;
+    console.log('Witness stack:');
+    witness.forEach((w, i) => console.log(`  [${i}]: ${w.substring(0, 20)}... (${w.length / 2} bytes)`));
+
     fs.writeFileSync(path.join(__dirname, '..', 'out.txt'), `${fundingTxId}\n${spendingTxId}\n`);
     console.log('Results written to out.txt');
 }
