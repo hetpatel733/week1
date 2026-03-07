@@ -212,9 +212,12 @@ async function main() {
         { [bobReceiveAddress]: eachReceives }
     ];
 
-    // Create spending PSBT and update with multisig descriptor for witness script
+    // Create spending PSBT and update with the raw-pubkey multisig descriptor
+    // (use pubkeys, not xpub/xprv, to avoid hardened derivation issues)
     let spendingPsbt = await client.command('createpsbt', spendingInputs, spendingOutputs);
-    spendingPsbt = await client.command('utxoupdatepsbt', spendingPsbt, [multiInfoAlice.descriptor]);
+    const pubDescRaw = `wsh(multi(2,${alicePubKey},${bobPubKey}))`;
+    const pubDescInfo = await client.command('getdescriptorinfo', pubDescRaw);
+    spendingPsbt = await client.command('utxoupdatepsbt', spendingPsbt, [pubDescInfo.descriptor]);
 
     // Both wallets sign (they now have private keys for the multisig)
     const aliceSpendSigned = await alice.command('walletprocesspsbt', spendingPsbt, true, 'ALL');
