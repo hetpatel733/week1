@@ -1,5 +1,6 @@
 const Client = require('bitcoin-core');
 const fs = require('fs');
+const path = require('path');
 
 const client = new Client({
     network: 'regtest',
@@ -230,8 +231,9 @@ async function main() {
     //   Line 2: txid of the spending transaction
     // ============================================================
     const outContent = `${fundingTxid}\n${spendingTxid}\n`;
-    fs.writeFileSync('out.txt', outContent);
-    console.log('Transaction IDs written to out.txt');
+    const outPath = path.join(__dirname, '..', 'out.txt');
+    fs.writeFileSync(outPath, outContent);
+    console.log('Transaction IDs written to', outPath);
 }
 
 main().catch(err => {
