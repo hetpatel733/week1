@@ -18,39 +18,60 @@ function getWalletClient(walletName) {
 
 async function loadOrCreateWallet(name) {
     try {
-        await client.command('createwallet', name);
+        await client.command('loadwallet', name);
     } catch (e) {
         const msg = (e.message || '').toLowerCase();
-        if (msg.includes('already exists') || msg.includes('database already exists')) {
+        if (msg.includes('already loaded')) {
+            // already loaded - so just proceed ahead
+        } else {
             try {
-                await client.command('loadwallet', name);
-            } catch (le) {
-                if (!(le.message || '').toLowerCase().includes('already loaded')) throw le;
+                await client.command('createwallet', name, false, false, '', false, false);
+            } catch (createErr) {
+                const cMsg = (createErr.message || '').toLowerCase();
+                if (cMsg.includes('already exists') || cMsg.includes('database already exists')) {
+                    await client.command('loadwallet', name);
+                } else {
+                    try {
+                        await client.command('createwallet', name);
+                    } catch (e2) {
+                        const e2Msg = (e2.message || '').toLowerCase();
+                        if (e2Msg.includes('already exists') || e2Msg.includes('database already exists')) {
+                            await client.command('loadwallet', name);
+                        } else {
+                            throw e2;
+                        }
+                    }
+                }
             }
-        } else if (!msg.includes('already loaded')) {
-            throw e;
         }
     }
 }
 
+// Extract private key expression from wallet's descriptor for a given address
 async function getPrivKeyExpr(walletClient, addr) {
     const addrInfo = await walletClient.command('getaddressinfo', addr);
-    const keyIndex = addrInfo.hdkeypath.split('/').pop();
+    const hdkeypath = addrInfo.hdkeypath;
+    const pathParts = hdkeypath.split('/');
+    const keyIndex = pathParts[pathParts.length - 1];
 
+    // Get all private descriptors from the wallet
     const descList = await walletClient.command('listdescriptors', true);
-    const pkhDesc = descList.descriptors.find(d => d.desc.startsWith('pkh(') && d.active && !d.internal);
+
+    // Find the external pkh descriptor
+    const pkhDesc = descList.descriptors.find(d =>
+        d.desc.startsWith('pkh(') && d.active && !d.internal
+    );
     if (!pkhDesc) throw new Error('Could not find pkh descriptor');
 
-    const keyExpr = pkhDesc.desc.slice(pkhDesc.desc.indexOf('(') + 1, pkhDesc.desc.lastIndexOf(')'));
+    const descStr = pkhDesc.desc;
+    const keyExpr = descStr.slice(descStr.indexOf('(') + 1, descStr.lastIndexOf(')'));
+
     return keyExpr.replace('*', keyIndex);
 }
 
-async function importDescriptor(walletClient, desc) {
-    const { checksum } = await client.command('getdescriptorinfo', desc);
-    await walletClient.command('importdescriptors', [{ desc: `${desc}#${checksum}`, timestamp: 'now' }]);
-}
-
 async function main() {
+    await client.getBlockchainInfo();
+
     await loadOrCreateWallet('Miner');
     await loadOrCreateWallet('Alice');
     await loadOrCreateWallet('Bob');
@@ -61,9 +82,9 @@ async function main() {
 
     // Mine blocks for spendable balance
     const minerAddress = await miner.getNewAddress();
-    const { blocks } = await client.getBlockchainInfo();
-    if (blocks < 103) {
-        await client.command('generatetoaddress', 103 - blocks, minerAddress);
+    const currentBlocks = (await client.getBlockchainInfo()).blocks;
+    if (currentBlocks < 103) {
+        await client.command('generatetoaddress', 103 - currentBlocks, minerAddress);
     }
     let minerBalance = await miner.getBalance();
     while (minerBalance < 150) {
@@ -72,8 +93,10 @@ async function main() {
     }
 
     // Fund Alice and Bob with 15 BTC each
-    await miner.sendToAddress(await alice.getNewAddress(), 15);
-    await miner.sendToAddress(await bob.getNewAddress(), 15);
+    const aliceFundAddress = await alice.getNewAddress();
+    const bobFundAddress = await bob.getNewAddress();
+    await miner.sendToAddress(aliceFundAddress, 15);
+    await miner.sendToAddress(bobFundAddress, 15);
     await client.command('generatetoaddress', 6, minerAddress);
 
     // Get public keys from legacy addresses
@@ -87,63 +110,103 @@ async function main() {
     const bobPrivKeyExpr = await getPrivKeyExpr(bob, bobKeyAddr);
 
     // Create 2-of-2 P2WSH multisig address
-    const { address: multisigAddress } = await client.command('createmultisig', 2, [alicePubKey, bobPubKey], 'bech32');
+    const multisigResult = await client.command('createmultisig', 2, [alicePubKey, bobPubKey], 'bech32');
+    const multisigAddress = multisigResult.address;
+    const witnessScript = multisigResult.redeemScript;
 
-    // Import multisig descriptors with private keys into each wallet
-    await importDescriptor(alice, `wsh(multi(2,${alicePrivKeyExpr},${bobPubKey}))`);
-    await importDescriptor(bob, `wsh(multi(2,${alicePubKey},${bobPrivKeyExpr}))`);
+    // Import multisig descriptors WITH private keys into each wallet
+    // Alice's wallet: Alice's private key + Bob's public key
+    const multiDescAlice = `wsh(multi(2,${alicePrivKeyExpr},${bobPubKey}))`;
+    const multiInfoAlice = await client.command('getdescriptorinfo', multiDescAlice);
+    const multiDescAliceWithCS = multiDescAlice + '#' + multiInfoAlice.checksum;
+    await alice.command('importdescriptors', [{ desc: multiDescAliceWithCS, timestamp: 'now' }]);
+
+    // Bob's wallet: Alice's public key + Bob's private key
+    const multiDescBob = `wsh(multi(2,${alicePubKey},${bobPrivKeyExpr}))`;
+    const multiInfoBob = await client.command('getdescriptorinfo', multiDescBob);
+    const multiDescBobWithCS = multiDescBob + '#' + multiInfoBob.checksum;
+    await bob.command('importdescriptors', [{ desc: multiDescBobWithCS, timestamp: 'now' }]);
 
     // Build funding PSBT
-    const aliceUTXO = (await alice.command('listunspent')).find(u => u.amount >= 10);
-    const bobUTXO = (await bob.command('listunspent')).find(u => u.amount >= 10);
+    const aliceUTXOs = await alice.command('listunspent');
+    const bobUTXOs = await bob.command('listunspent');
+    const aliceUTXO = aliceUTXOs.find(u => u.amount >= 10);
+    const bobUTXO = bobUTXOs.find(u => u.amount >= 10);
     if (!aliceUTXO || !bobUTXO) throw new Error('Insufficient UTXOs for Alice or Bob');
 
+    const totalInput = aliceUTXO.amount + bobUTXO.amount;
     const multisigAmount = 20;
-    const changeEach = parseFloat(((aliceUTXO.amount + bobUTXO.amount - multisigAmount - 0.0002) / 2).toFixed(8));
+    const fundingFee = 0.0002;
+    const changeEach = parseFloat(((totalInput - multisigAmount - fundingFee) / 2).toFixed(8));
 
-    let fundingPsbt = await client.command('createpsbt',
-        [{ txid: aliceUTXO.txid, vout: aliceUTXO.vout }, { txid: bobUTXO.txid, vout: bobUTXO.vout }],
-        [{ [multisigAddress]: multisigAmount }, { [await alice.getNewAddress()]: changeEach }, { [await bob.getNewAddress()]: changeEach }]
-    );
+    const aliceChangeAddress = await alice.getNewAddress();
+    const bobChangeAddress = await bob.getNewAddress();
+
+    const fundingInputs = [
+        { txid: aliceUTXO.txid, vout: aliceUTXO.vout },
+        { txid: bobUTXO.txid, vout: bobUTXO.vout }
+    ];
+    const fundingOutputs = [
+        { [multisigAddress]: multisigAmount },
+        { [aliceChangeAddress]: changeEach },
+        { [bobChangeAddress]: changeEach }
+    ];
+
+    let fundingPsbt = await client.command('createpsbt', fundingInputs, fundingOutputs);
     fundingPsbt = await client.command('utxoupdatepsbt', fundingPsbt);
 
     const aliceFundSigned = await alice.command('walletprocesspsbt', fundingPsbt);
     const bobFundSigned = await bob.command('walletprocesspsbt', fundingPsbt);
 
-    const finalizedFunding = await client.command('finalizepsbt',
-        await client.command('combinepsbt', [aliceFundSigned.psbt, bobFundSigned.psbt])
-    );
+    const combinedFunding = await client.command('combinepsbt', [aliceFundSigned.psbt, bobFundSigned.psbt]);
+    const finalizedFunding = await client.command('finalizepsbt', combinedFunding);
     if (!finalizedFunding.complete) throw new Error('Funding PSBT could not be finalized');
 
     const fundingTxId = await client.sendRawTransaction(finalizedFunding.hex);
+
     await client.command('generatetoaddress', 6, minerAddress);
 
     // Build spending PSBT
     const fundingTxDetails = await client.command('getrawtransaction', fundingTxId, true);
-    const multisigVout = fundingTxDetails.vout.findIndex(out =>
-        Math.abs(out.value - multisigAmount) < 0.00001 &&
-        out.scriptPubKey.type === 'witness_v0_scripthash'
-    );
+    let multisigVout = -1;
+    for (let i = 0; i < fundingTxDetails.vout.length; i++) {
+        const out = fundingTxDetails.vout[i];
+        if (Math.abs(out.value - multisigAmount) < 0.00001 &&
+            out.scriptPubKey.type === 'witness_v0_scripthash') {
+            multisigVout = i;
+            break;
+        }
+    }
     if (multisigVout === -1) throw new Error('Multisig UTXO not found in funding transaction');
 
-    const eachReceives = parseFloat(((multisigAmount - 0.0002) / 2).toFixed(8));
+    const aliceReceiveAddress = await alice.getNewAddress();
+    const bobReceiveAddress = await bob.getNewAddress();
+    const spendingFee = 0.0002;
+    const eachReceives = parseFloat(((multisigAmount - spendingFee) / 2).toFixed(8));
 
-    let spendingPsbt = await client.command('createpsbt',
-        [{ txid: fundingTxId, vout: multisigVout }],
-        [{ [await alice.getNewAddress()]: eachReceives }, { [await bob.getNewAddress()]: eachReceives }]
-    );
-    const { descriptor } = await client.command('getdescriptorinfo', `wsh(multi(2,${alicePubKey},${bobPubKey}))`);
-    spendingPsbt = await client.command('utxoupdatepsbt', spendingPsbt, [descriptor]);
+    const spendingInputs = [{ txid: fundingTxId, vout: multisigVout }];
+    const spendingOutputs = [
+        { [aliceReceiveAddress]: eachReceives },
+        { [bobReceiveAddress]: eachReceives }
+    ];
 
+    // Create spending PSBT and update with the raw-pubkey multisig descriptor
+    // (use pubkeys, not xpub/xprv, to avoid hardened derivation issues)
+    let spendingPsbt = await client.command('createpsbt', spendingInputs, spendingOutputs);
+    const pubDescRaw = `wsh(multi(2,${alicePubKey},${bobPubKey}))`;
+    const pubDescInfo = await client.command('getdescriptorinfo', pubDescRaw);
+    spendingPsbt = await client.command('utxoupdatepsbt', spendingPsbt, [pubDescInfo.descriptor]);
+
+    // Both wallets sign (they now have private keys for the multisig)
     const aliceSpendSigned = await alice.command('walletprocesspsbt', spendingPsbt, true, 'ALL');
     const bobSpendSigned = await bob.command('walletprocesspsbt', spendingPsbt, true, 'ALL');
 
-    const finalizedSpending = await client.command('finalizepsbt',
-        await client.command('combinepsbt', [aliceSpendSigned.psbt, bobSpendSigned.psbt])
-    );
+    const combinedSpending = await client.command('combinepsbt', [aliceSpendSigned.psbt, bobSpendSigned.psbt]);
+    const finalizedSpending = await client.command('finalizepsbt', combinedSpending);
     if (!finalizedSpending.complete) throw new Error('Spending PSBT could not be finalized');
 
     const spendingTxId = await client.sendRawTransaction(finalizedSpending.hex);
+
     await client.command('generatetoaddress', 6, minerAddress);
 
     fs.writeFileSync(path.join(__dirname, '..', 'out.txt'), `${fundingTxId}\n${spendingTxId}\n`);
