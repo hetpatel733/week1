@@ -62,9 +62,10 @@ async function main() {
     //         then send some coins to Employer
     // ============================================================
 
-    // Get a Miner address and mine 101 blocks to it (coinbase needs 100 confirmations to mature)
+    // Get a Miner address and mine 200 blocks to it (coinbase needs 100 confirmations to mature)
+    // Mining 200 blocks matures ~100 coinbase rewards (100 × 50 = 5000 BTC spendable)
     const minerAddress = await minerClient.getNewAddress();
-    await minerClient.generateToAddress(101, minerAddress);
+    await minerClient.generateToAddress(200, minerAddress);
 
     // Check Miner balance and confirm it's sufficient
     const minerBalance = await minerClient.getBalance();
