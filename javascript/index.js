@@ -88,6 +88,7 @@ async function main() {
 
     // Broadcasting before block 500 would fail like this -- "non-final" — nLockTime not reached.
     // Mine remaining blocks to reach height 500, then broadcast.
+
     const currentHeight = await client.getBlockCount();
     const blocksNeeded = 500 - currentHeight;
     if (blocksNeeded > 0) {
